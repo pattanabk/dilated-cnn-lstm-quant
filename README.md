@@ -27,6 +27,38 @@ Includes:
 - OHLC forecasting
 - Quant research architecture
 
+## Sample Results
+
+### V31.2 FAST CPU RESULTS
+
+VOL MAE         : 0.003899
+VOL RMSE        : 0.005953
+REGIME ACCURACY : 0.377193
+
+### Example Forecast
+
+LAST CLOSE       : 4743.50
+EXPECTED MOVE    : 34.30
+EXPECTED VOL     : 0.007232
+NEXT REGIME      : EXPANSION
+
+## Model Architecture
+
+- Dilated CNN feature extraction
+- LSTM temporal modeling
+- Multi-task learning
+- Volatility forecasting
+- Regime classification
+- Cross-market macro features
+
+## Future Improvements
+
+- Transformer architectures
+- Real-time websocket feeds
+- Cross-exchange arbitrage integration
+- Reinforcement learning execution
+- Orderbook microstructure features
+
 ## Disclaimer
 
 Research/educational purposes only.
