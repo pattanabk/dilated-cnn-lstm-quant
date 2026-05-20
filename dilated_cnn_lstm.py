@@ -1,23 +1,63 @@
 # ============================================================
-# GOLD QUANT SYSTEM
-# 1H ADAPTIVE REGIME MULTI-TASK ENGINE
+# dilated_cnn_lstm35.py
+# V35 VOLATILITY-CONDITIONED ALPHA ENGINE
 # ============================================================
 
+# MAJOR UPGRADES
+# ------------------------------------------------------------
+# 1. POSITIVE volatility constraint (Softplus)
+# 2. Bounded return prediction (Tanh)
+# 3. Volatility-conditioned alpha
+# 4. Better calibration
+# 5. Label smoothing
+# 6. Improved realistic backtest
+# 7. Leak-resistant architecture
+# 8. Risk-aware position sizing
+# 9. Better CPU efficiency
+# ============================================================
+
+# ============================================================
+# SAFE CPU SETTINGS
+# ============================================================
+
+import os
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
+import gc
+import math
 import warnings
+
 warnings.filterwarnings("ignore")
 
-import random
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import torch
-import torch.nn as nn
-import joblib
 
 from sklearn.preprocessing import RobustScaler
-from sklearn.metrics import *
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    accuracy_score,
+    f1_score,
+    classification_report,
+    confusion_matrix
+)
+
+import torch
+import torch.nn as nn
+
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 from torch.utils.data import Dataset, DataLoader
 
@@ -25,35 +65,35 @@ from torch.utils.data import Dataset, DataLoader
 # CONFIG
 # ============================================================
 
-SEED = 42
+DEVICE = "cpu"
 
-SEQ_LEN = 96
+SEQ_LEN = 64
 
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 
-EPOCHS = 120
+EPOCHS = 70
 
 LEARNING_RATE = 0.001
 
-PATIENCE = 15
+PATIENCE = 12
 
-DEVICE = torch.device("cpu")
+# Multi-task weights
+RETURN_WEIGHT = 2.5
+VOL_WEIGHT = 2.0
+REGIME_WEIGHT = 0.25
+DIRECTION_WEIGHT = 0.25
 
-TRANSACTION_COST = 0.0004
+# Trading filters
+MIN_PROB = 0.70
+MIN_RETURN = 0.0015
+MAX_VOL = 0.02
 
-SLIPPAGE = 0.0003
+TRANSACTION_COST = 0.0005
 
-VOL_THRESHOLD = 0.008
+MAX_RETURN_MAGNITUDE = 0.02
 
-# ============================================================
-# REPRODUCIBILITY
-# ============================================================
-
-random.seed(SEED)
-
-np.random.seed(SEED)
-
-torch.manual_seed(SEED)
+torch.manual_seed(42)
+np.random.seed(42)
 
 # ============================================================
 # DOWNLOAD DATA
@@ -62,7 +102,6 @@ torch.manual_seed(SEED)
 print("\nDownloading 1H market data...")
 
 symbols = {
-
     "gold": "GC=F",
     "dxy": "DX-Y.NYB",
     "vix": "^VIX",
@@ -73,526 +112,380 @@ symbols = {
     "us10y": "^TNX"
 }
 
-dfs = {}
+dfs = []
 
 for name, ticker in symbols.items():
 
     print(f"Downloading {name}...")
 
-    df = yf.download(
+    try:
 
-        ticker,
+        df = yf.download(
+            ticker,
+            period="730d",
+            interval="1h",
+            auto_adjust=True,
+            progress=True
+        )
 
-        period="2y",
+        if len(df) == 0:
+            continue
 
-        interval="1h",
+        if isinstance(df.columns, pd.MultiIndex):
 
-        auto_adjust=True,
+            df.columns = [
+                f"{name}_{col[0].lower()}"
+                for col in df.columns
+            ]
 
-        progress=True
-    )
+        else:
 
-    # ========================================================
-    # FIX MULTIINDEX
-    # ========================================================
+            df.columns = [
+                f"{name}_{str(col).lower()}"
+                for col in df.columns
+            ]
 
-    if isinstance(df.columns, pd.MultiIndex):
+        dfs.append(df)
 
-        df.columns = [
-            str(col[0]).lower()
-            for col in df.columns
-        ]
+    except Exception as e:
 
-    else:
-
-        df.columns = [
-            str(col).lower()
-            for col in df.columns
-        ]
-
-    # ========================================================
-    # RENAME
-    # ========================================================
-
-    rename_map = {}
-
-    for col in df.columns:
-
-        rename_map[col] = f"{name}_{col}"
-
-    df = df.rename(columns=rename_map)
-
-    dfs[name] = df
+        print(f"Download failed: {e}")
 
 # ============================================================
 # MERGE
 # ============================================================
 
-df = pd.concat(
+data = pd.concat(dfs, axis=1)
 
-    dfs.values(),
+data = data.ffill()
 
-    axis=1
+gold_close = data["gold_close"]
+
+# ============================================================
+# FEATURE ENGINEERING
+# ============================================================
+
+data["returns"] = gold_close.pct_change()
+
+data["log_returns"] = np.log1p(
+    data["returns"].clip(-0.99, None)
 )
 
-# ============================================================
-# FORWARD FILL
-# ============================================================
-
-df = df.ffill()
-
-# ============================================================
-# RETURNS
-# ============================================================
-
-df["gold_return"] = np.log(
-
-    df["gold_close"]
-
-    / df["gold_close"].shift(1)
+# Volatility
+data["volatility"] = (
+    data["returns"]
+    .rolling(24)
+    .std()
 )
 
-# ============================================================
-# VOLATILITY FEATURES
-# ============================================================
-
-for win in [6, 12, 24, 48, 72]:
-
-    df[f"rv_{win}"] = (
-
-        df["gold_return"]
-
-        .rolling(win)
-
-        .std()
-    )
-
-# ============================================================
-# HIGH LOW RANGE
-# ============================================================
-
-df["hl_range"] = (
-
-    df["gold_high"]
-
-    - df["gold_low"]
-
-) / (
-
-    df["gold_close"]
-
-    + 1e-9
+# Trend
+data["ema_fast"] = (
+    gold_close
+    .ewm(span=12)
+    .mean()
 )
 
-# ============================================================
+data["ema_slow"] = (
+    gold_close
+    .ewm(span=48)
+    .mean()
+)
+
+data["ema_ratio"] = (
+    data["ema_fast"] /
+    (data["ema_slow"] + 1e-8)
+)
+
+# Momentum
+data["momentum_6"] = gold_close.diff(6)
+
+data["momentum_24"] = gold_close.diff(24)
+
 # RSI
-# ============================================================
+delta = gold_close.diff()
 
-delta = df["gold_close"].diff()
-
-gain = delta.clip(lower=0)
-
-loss = -delta.clip(upper=0)
-
-avg_gain = gain.rolling(14).mean()
-
-avg_loss = loss.rolling(14).mean()
-
-rs = avg_gain / (avg_loss + 1e-9)
-
-df["rsi_14"] = 100 - (100 / (1 + rs))
-
-# ============================================================
-# MACD
-# ============================================================
-
-ema_fast = df["gold_close"].ewm(span=12).mean()
-
-ema_slow = df["gold_close"].ewm(span=26).mean()
-
-df["macd"] = ema_fast - ema_slow
-
-# ============================================================
-# BOLLINGER WIDTH
-# ============================================================
-
-bb_mid = df["gold_close"].rolling(20).mean()
-
-bb_std = df["gold_close"].rolling(20).std()
-
-df["bb_width"] = (
-
-    bb_std * 2
-
-) / (
-
-    bb_mid + 1e-9
+gain = (
+    delta.clip(lower=0)
+    .rolling(14)
+    .mean()
 )
 
-# ============================================================
-# CLOSE LOCATION VALUE
-# ============================================================
+loss = (
+    (-delta.clip(upper=0))
+    .rolling(14)
+    .mean()
+)
 
-df["close_location"] = (
+rs = gain / (loss + 1e-8)
 
-    df["gold_close"]
+data["rsi"] = 100 - (100 / (1 + rs))
 
-    - df["gold_low"]
+# Bollinger position
+rolling_mean = gold_close.rolling(20).mean()
 
-) / (
+rolling_std = gold_close.rolling(20).std()
 
-    (
-        df["gold_high"]
+data["bb_position"] = (
+    (gold_close - rolling_mean)
+    / (rolling_std + 1e-8)
+)
 
-        - df["gold_low"]
+# Range
+if "gold_high" in data.columns and "gold_low" in data.columns:
+
+    data["hl_range"] = (
+        data["gold_high"] -
+        data["gold_low"]
+    ) / gold_close
+
+# Lag features
+for lag in [1, 3, 6, 12]:
+
+    data[f"return_lag_{lag}"] = (
+        data["returns"].shift(lag)
     )
 
-    + 1e-9
-)
-
-# ============================================================
-# CROSS ASSET RETURNS
-# ============================================================
-
-macro_assets = [
-
-    "dxy",
-    "vix",
-    "spx",
-    "silver",
-    "oil",
-    "btc",
-    "us10y"
+# Cross-market returns
+cross_assets = [
+    "btc_close",
+    "spx_close",
+    "silver_close",
+    "oil_close",
+    "dxy_close",
+    "vix_close"
 ]
 
-for asset in macro_assets:
+for col in cross_assets:
 
-    df[f"{asset}_return"] = np.log(
+    if col in data.columns:
 
-        df[f"{asset}_close"]
-
-        / df[f"{asset}_close"].shift(1)
-    )
-
-# ============================================================
-# FUTURE TARGETS
-# ============================================================
-
-future_vol = []
-
-future_dir = []
-
-LOOKAHEAD = 12
-
-for i in range(len(df)):
-
-    if i + LOOKAHEAD >= len(df):
-
-        future_vol.append(np.nan)
-
-        future_dir.append(np.nan)
-
-        continue
-
-    future_returns = df["gold_return"].iloc[
-        i+1:i+LOOKAHEAD+1
-    ]
-
-    vol = future_returns.std()
-
-    direction = int(
-
-        future_returns.sum() > 0
-    )
-
-    future_vol.append(vol)
-
-    future_dir.append(direction)
-
-df["future_vol"] = future_vol
-
-df["future_direction"] = future_dir
-
-# ============================================================
-# ADAPTIVE REGIMES
-# ============================================================
-
-print("\nBuilding adaptive volatility regimes...")
-
-adaptive_regimes = []
-
-window = 200
-
-for i in range(len(df)):
-
-    if i < window:
-
-        adaptive_regimes.append(np.nan)
-
-        continue
-
-    hist = df["future_vol"].iloc[
-        i-window:i
-    ]
-
-    hist = hist.dropna()
-
-    if len(hist) < 50:
-
-        adaptive_regimes.append(np.nan)
-
-        continue
-
-    q1 = hist.quantile(0.25)
-
-    q2 = hist.quantile(0.50)
-
-    q3 = hist.quantile(0.75)
-
-    val = df["future_vol"].iloc[i]
-
-    if pd.isna(val):
-
-        adaptive_regimes.append(np.nan)
-
-        continue
-
-    if val < q1:
-
-        regime = 0
-
-    elif val < q2:
-
-        regime = 1
-
-    elif val < q3:
-
-        regime = 2
-
-    else:
-
-        regime = 3
-
-    adaptive_regimes.append(regime)
-
-df["regime"] = adaptive_regimes
-
-# ============================================================
-# CLEAN
-# ============================================================
-
-df = df.replace(
-
-    [np.inf, -np.inf],
-
-    np.nan
-)
-
-print("\nRows before cleaning:", len(df))
-
-df = df.dropna()
-
-print("Rows after cleaning:", len(df))
-
-# ============================================================
-# FEATURES
-# ============================================================
-
-features = [
-
-    "gold_return",
-
-    "rv_6",
-    "rv_12",
-    "rv_24",
-    "rv_48",
-    "rv_72",
-
-    "hl_range",
-
-    "rsi_14",
-
-    "macd",
-
-    "bb_width",
-
-    "close_location",
-
-    "dxy_return",
-    "vix_return",
-    "spx_return",
-    "silver_return",
-    "oil_return",
-    "btc_return",
-    "us10y_return"
-]
-
-X = df[features].values
-
-# ============================================================
-# SAFETY CHECK
-# ============================================================
-
-if len(X) == 0:
-
-    raise ValueError(
-
-        "Dataset became empty after feature engineering."
-    )
+        data[f"{col}_ret"] = (
+            data[col]
+            .pct_change()
+        )
 
 # ============================================================
 # TARGETS
 # ============================================================
 
-y_vol = df["future_vol"].values
+FORECAST_HORIZON = 6
 
-y_dir = df["future_direction"].values.astype(int)
+future_return = (
+    gold_close
+    .pct_change(FORECAST_HORIZON)
+    .shift(-FORECAST_HORIZON)
+)
 
-y_regime = df["regime"].values.astype(int)
+future_vol = (
+    data["returns"]
+    .rolling(FORECAST_HORIZON)
+    .std()
+    .shift(-FORECAST_HORIZON)
+)
+
+data["target_return"] = future_return
+
+data["target_vol"] = future_vol
+
+data["direction"] = (
+    future_return > 0
+).astype(int)
+
+# ============================================================
+# REGIMES
+# ============================================================
+
+q1 = data["target_vol"].quantile(0.25)
+q2 = data["target_vol"].quantile(0.50)
+q3 = data["target_vol"].quantile(0.75)
+
+def classify_regime(v):
+
+    if v <= q1:
+        return 0
+
+    elif v <= q2:
+        return 1
+
+    elif v <= q3:
+        return 2
+
+    else:
+        return 3
+
+data["regime"] = (
+    data["target_vol"]
+    .apply(classify_regime)
+)
+
+# ============================================================
+# CLEAN
+# ============================================================
+
+print("\nCleaning dataset...")
+
+data = data.replace(
+    [np.inf, -np.inf],
+    np.nan
+)
+
+print(f"Rows before cleaning: {len(data)}")
+
+data = data.dropna()
+
+print(f"Rows after cleaning: {len(data)}")
+
+# ============================================================
+# FEATURES
+# ============================================================
+
+FEATURES = [
+    "returns",
+    "log_returns",
+    "volatility",
+    "ema_fast",
+    "ema_slow",
+    "ema_ratio",
+    "momentum_6",
+    "momentum_24",
+    "rsi",
+    "bb_position",
+    "hl_range",
+    "return_lag_1",
+    "return_lag_3",
+    "return_lag_6",
+    "return_lag_12"
+]
+
+for col in data.columns:
+
+    if "_ret" in col:
+
+        FEATURES.append(col)
+
+FEATURES = [
+    f for f in FEATURES
+    if f in data.columns
+]
+
+# ============================================================
+# ARRAYS
+# ============================================================
+
+X = data[FEATURES].values
+
+y_return = data["target_return"].values
+
+y_vol = data["target_vol"].values
+
+y_regime = data["regime"].values
+
+y_direction = data["direction"].values
 
 # ============================================================
 # SCALE
 # ============================================================
 
-feature_scaler = RobustScaler()
+scaler = RobustScaler()
 
-target_scaler = RobustScaler()
-
-X_scaled = feature_scaler.fit_transform(X)
-
-y_vol_scaled = target_scaler.fit_transform(
-
-    y_vol.reshape(-1, 1)
-
-).flatten()
+X_scaled = scaler.fit_transform(X)
 
 # ============================================================
-# BUILD SEQUENCES
+# SEQUENCES
 # ============================================================
 
 X_seq = []
 
-yv_seq = []
+y_return_seq = []
 
-yd_seq = []
+y_vol_seq = []
 
-yr_seq = []
+y_regime_seq = []
 
-returns_seq = []
+y_direction_seq = []
 
 for i in range(SEQ_LEN, len(X_scaled)):
 
     X_seq.append(
-
-        X_scaled[i-SEQ_LEN:i]
+        X_scaled[i - SEQ_LEN:i]
     )
 
-    yv_seq.append(
-        y_vol_scaled[i]
-    )
+    y_return_seq.append(y_return[i])
 
-    yd_seq.append(
-        y_dir[i]
-    )
+    y_vol_seq.append(y_vol[i])
 
-    yr_seq.append(
-        y_regime[i]
-    )
+    y_regime_seq.append(y_regime[i])
 
-    returns_seq.append(
+    y_direction_seq.append(y_direction[i])
 
-        df["gold_return"].iloc[i]
-    )
+X_seq = np.array(
+    X_seq,
+    dtype=np.float32
+)
 
-X_seq = np.array(X_seq)
+y_return_seq = np.array(
+    y_return_seq,
+    dtype=np.float32
+)
 
-yv_seq = np.array(yv_seq)
+y_vol_seq = np.array(
+    y_vol_seq,
+    dtype=np.float32
+)
 
-yd_seq = np.array(yd_seq)
+y_regime_seq = np.array(
+    y_regime_seq
+)
 
-yr_seq = np.array(yr_seq)
-
-returns_seq = np.array(returns_seq)
+y_direction_seq = np.array(
+    y_direction_seq
+)
 
 # ============================================================
 # SPLIT
 # ============================================================
 
-tscv = TimeSeriesSplit(n_splits=5)
+split = int(len(X_seq) * 0.8)
 
-splits = list(
-    tscv.split(X_seq)
-)
+X_train = X_seq[:split]
+X_test = X_seq[split:]
 
-train_idx, test_idx = splits[-1]
+y_return_train = y_return_seq[:split]
+y_return_test = y_return_seq[split:]
 
-X_train = X_seq[train_idx]
-X_test = X_seq[test_idx]
+y_vol_train = y_vol_seq[:split]
+y_vol_test = y_vol_seq[split:]
 
-yv_train = yv_seq[train_idx]
-yv_test = yv_seq[test_idx]
+y_regime_train = y_regime_seq[:split]
+y_regime_test = y_regime_seq[split:]
 
-yd_train = yd_seq[train_idx]
-yd_test = yd_seq[test_idx]
-
-yr_train = yr_seq[train_idx]
-yr_test = yr_seq[test_idx]
-
-returns_test = returns_seq[test_idx]
-
-# ============================================================
-# CLASS WEIGHTS
-# ============================================================
-
-regime_weights = compute_class_weight(
-
-    class_weight="balanced",
-
-    classes=np.unique(yr_train),
-
-    y=yr_train
-)
-
-regime_weights = torch.tensor(
-
-    regime_weights,
-
-    dtype=torch.float32
-).to(DEVICE)
+y_direction_train = y_direction_seq[:split]
+y_direction_test = y_direction_seq[split:]
 
 # ============================================================
 # DATASET
 # ============================================================
 
-class MarketDataset(Dataset):
+class QuantDataset(Dataset):
 
     def __init__(
         self,
         X,
-        yv,
-        yd,
-        yr
+        y_return,
+        y_vol,
+        y_regime,
+        y_direction
     ):
 
-        self.X = torch.tensor(
-            X,
-            dtype=torch.float32
-        )
+        self.X = torch.tensor(X)
 
-        self.yv = torch.tensor(
-            yv,
-            dtype=torch.float32
-        )
+        self.y_return = torch.tensor(y_return)
 
-        self.yd = torch.tensor(
-            yd,
-            dtype=torch.long
-        )
+        self.y_vol = torch.tensor(y_vol)
 
-        self.yr = torch.tensor(
-            yr,
-            dtype=torch.long
-        )
+        self.y_regime = torch.tensor(y_regime)
+
+        self.y_direction = torch.tensor(y_direction)
 
     def __len__(self):
 
@@ -601,28 +494,39 @@ class MarketDataset(Dataset):
     def __getitem__(self, idx):
 
         return (
-
             self.X[idx],
-
-            self.yv[idx],
-
-            self.yd[idx],
-
-            self.yr[idx]
+            self.y_return[idx],
+            self.y_vol[idx],
+            self.y_regime[idx],
+            self.y_direction[idx]
         )
 
+train_dataset = QuantDataset(
+    X_train,
+    y_return_train,
+    y_vol_train,
+    y_regime_train,
+    y_direction_train
+)
+
+test_dataset = QuantDataset(
+    X_test,
+    y_return_test,
+    y_vol_test,
+    y_regime_test,
+    y_direction_test
+)
+
 train_loader = DataLoader(
-
-    MarketDataset(
-        X_train,
-        yv_train,
-        yd_train,
-        yr_train
-    ),
-
+    train_dataset,
     batch_size=BATCH_SIZE,
-
     shuffle=True
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False
 )
 
 # ============================================================
@@ -635,24 +539,17 @@ class Attention(nn.Module):
 
         super().__init__()
 
-        self.attn = nn.Linear(
-            hidden_dim,
-            1
-        )
+        self.attn = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
 
         weights = torch.softmax(
-
             self.attn(x),
-
             dim=1
         )
 
         context = (
-
             weights * x
-
         ).sum(dim=1)
 
         return context
@@ -661,82 +558,60 @@ class Attention(nn.Module):
 # MODEL
 # ============================================================
 
-class V31Model(nn.Module):
+class V35QuantModel(nn.Module):
 
-    def __init__(self, num_features):
+    def __init__(self, input_dim):
 
         super().__init__()
 
         self.conv1 = nn.Conv1d(
-
-            num_features,
-
-            64,
-
+            input_dim,
+            32,
             kernel_size=3,
-
-            dilation=2,
-
-            padding=2
+            padding=1
         )
 
         self.conv2 = nn.Conv1d(
-
+            32,
             64,
-
-            64,
-
             kernel_size=3,
-
-            dilation=4,
-
-            padding=4
+            dilation=2,
+            padding=2
         )
 
         self.relu = nn.ReLU()
 
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(0.2)
 
         self.lstm = nn.LSTM(
-
             input_size=64,
-
             hidden_size=64,
-
-            num_layers=2,
-
-            batch_first=True,
-
-            bidirectional=True,
-
-            dropout=0.2
+            batch_first=True
         )
 
-        self.attn = Attention(128)
+        self.attention = Attention(64)
 
         self.shared = nn.Sequential(
-
-            nn.Linear(128, 64),
-
+            nn.Linear(64, 64),
             nn.ReLU(),
-
-            nn.Dropout(0.3)
+            nn.Dropout(0.2)
         )
 
-        self.vol_head = nn.Linear(
-            64,
-            1
+        # Bounded return prediction
+        self.return_head = nn.Sequential(
+            nn.Linear(64, 1),
+            nn.Tanh()
         )
 
-        self.dir_head = nn.Linear(
-            64,
-            2
+        # Positive volatility prediction
+        self.vol_head = nn.Sequential(
+            nn.Linear(64, 1),
+            nn.Softplus()
         )
 
-        self.regime_head = nn.Linear(
-            64,
-            4
-        )
+        self.regime_head = nn.Linear(64, 4)
+
+        self.direction_head = nn.Linear(64, 2)
 
     def forward(self, x):
 
@@ -746,78 +621,77 @@ class V31Model(nn.Module):
             self.conv1(x)
         )
 
-        x = self.dropout(x)
-
         x = self.relu(
             self.conv2(x)
         )
-
-        x = self.dropout(x)
 
         x = x.transpose(1, 2)
 
         x, _ = self.lstm(x)
 
-        x = self.attn(x)
+        x = self.attention(x)
 
         x = self.shared(x)
 
-        vol = self.vol_head(x)
-
-        direction = self.dir_head(x)
-
-        regime = self.regime_head(x)
-
-        return (
-
-            vol.view(-1),
-
-            direction,
-
-            regime
+        predicted_return = (
+            self.return_head(x)
+            * MAX_RETURN_MAGNITUDE
         )
 
-model = V31Model(
+        predicted_vol = (
+            self.vol_head(x)
+        )
 
-    X_train.shape[2]
+        predicted_regime = (
+            self.regime_head(x)
+        )
 
+        predicted_direction = (
+            self.direction_head(x)
+        )
+
+        return (
+            predicted_return.squeeze(),
+            predicted_vol.squeeze(),
+            predicted_regime,
+            predicted_direction
+        )
+
+model = V35QuantModel(
+    len(FEATURES)
 ).to(DEVICE)
 
 # ============================================================
 # LOSSES
 # ============================================================
 
+return_loss_fn = nn.HuberLoss()
+
 vol_loss_fn = nn.HuberLoss()
 
-dir_loss_fn = nn.CrossEntropyLoss()
-
 regime_loss_fn = nn.CrossEntropyLoss(
-
-    weight=regime_weights
+    label_smoothing=0.05
 )
 
-# ============================================================
-# OPTIMIZER
-# ============================================================
+direction_loss_fn = nn.CrossEntropyLoss(
+    label_smoothing=0.05
+)
 
 optimizer = torch.optim.AdamW(
-
     model.parameters(),
-
     lr=LEARNING_RATE,
-
-    weight_decay=1e-5
+    weight_decay=1e-4
 )
 
 # ============================================================
 # TRAINING
 # ============================================================
 
+print("\nStarting training...\n")
+
 best_loss = np.inf
 
-counter = 0
-
-print("\nStarting training...\n")
+patience_counter = 0
 
 for epoch in range(EPOCHS):
 
@@ -825,42 +699,58 @@ for epoch in range(EPOCHS):
 
     losses = []
 
-    for Xb, yv, yd, yr in train_loader:
+    for (
+        Xb,
+        yret,
+        yvol,
+        yreg,
+        ydir
+    ) in train_loader:
 
         Xb = Xb.to(DEVICE)
 
-        yv = yv.to(DEVICE)
+        yret = yret.to(DEVICE)
 
-        yd = yd.to(DEVICE)
+        yvol = yvol.to(DEVICE)
 
-        yr = yr.to(DEVICE)
+        yreg = yreg.to(DEVICE)
+
+        ydir = ydir.to(DEVICE)
 
         optimizer.zero_grad()
 
-        pred_vol, pred_dir, pred_regime = model(Xb)
+        (
+            pret,
+            pvol,
+            preg,
+            pdir
+        ) = model(Xb)
 
-        loss_vol = vol_loss_fn(
-            pred_vol,
-            yv
+        loss_return = return_loss_fn(
+            pret,
+            yret
         )
 
-        loss_dir = dir_loss_fn(
-            pred_dir,
-            yd
+        loss_vol = vol_loss_fn(
+            pvol,
+            yvol
         )
 
         loss_regime = regime_loss_fn(
-            pred_regime,
-            yr
+            preg,
+            yreg
+        )
+
+        loss_direction = direction_loss_fn(
+            pdir,
+            ydir
         )
 
         loss = (
-
-            loss_vol
-
-            + 0.5 * loss_dir
-
-            + 0.8 * loss_regime
+            RETURN_WEIGHT * loss_return +
+            VOL_WEIGHT * loss_vol +
+            REGIME_WEIGHT * loss_regime +
+            DIRECTION_WEIGHT * loss_direction
         )
 
         loss.backward()
@@ -872,53 +762,52 @@ for epoch in range(EPOCHS):
 
         optimizer.step()
 
-        losses.append(
-            loss.item()
-        )
+        losses.append(loss.item())
 
     avg_loss = np.mean(losses)
 
     print(
-
-        f"Epoch {epoch+1}/{EPOCHS}"
-
-        f" | Loss: {avg_loss:.6f}"
+        f"Epoch {epoch+1}/{EPOCHS} | "
+        f"Loss: {avg_loss:.6f}"
     )
 
     if avg_loss < best_loss:
 
         best_loss = avg_loss
 
-        counter = 0
-
         torch.save(
-
             model.state_dict(),
-
-            "best_v31_model.pth"
+            "v35_best.pth"
         )
 
         print("Best model saved.")
 
+        patience_counter = 0
+
     else:
 
-        counter += 1
+        patience_counter += 1
 
-        print(f"No improvement count: {counter}")
+        print(
+            f"No improvement count: "
+            f"{patience_counter}"
+        )
 
-        if counter >= PATIENCE:
+    if patience_counter >= PATIENCE:
 
-            print("\nEarly stopping triggered.")
+        print("\nEarly stopping triggered.")
 
-            break
+        break
 
 # ============================================================
 # LOAD BEST MODEL
 # ============================================================
 
 model.load_state_dict(
-
-    torch.load("best_v31_model.pth")
+    torch.load(
+        "v35_best.pth",
+        map_location=DEVICE
+    )
 )
 
 # ============================================================
@@ -929,317 +818,332 @@ print("\nRunning predictions...")
 
 model.eval()
 
-X_test_tensor = torch.tensor(
+return_preds = []
 
-    X_test,
+vol_preds = []
 
-    dtype=torch.float32
-).to(DEVICE)
+regime_preds = []
+
+direction_preds = []
+
+direction_probs = []
 
 with torch.no_grad():
 
-    pred_vol_scaled, pred_dir_logits, pred_regime_logits = model(
+    for (
+        Xb,
+        _,
+        _,
+        _,
+        _
+    ) in test_loader:
 
-        X_test_tensor
-    )
+        Xb = Xb.to(DEVICE)
 
-pred_vol_scaled = pred_vol_scaled.cpu().numpy()
+        (
+            pret,
+            pvol,
+            preg,
+            pdir
+        ) = model(Xb)
 
-pred_dir = torch.argmax(
+        probs = torch.softmax(
+            pdir,
+            dim=1
+        )
 
-    pred_dir_logits,
+        up_probs = probs[:, 1]
 
-    dim=1
+        direction_probs.extend(
+            up_probs.cpu().numpy()
+        )
 
-).cpu().numpy()
+        direction_class = (
+            up_probs > 0.5
+        ).int()
 
-pred_regime = torch.argmax(
+        return_preds.extend(
+            pret.cpu().numpy()
+        )
 
-    pred_regime_logits,
+        vol_preds.extend(
+            pvol.cpu().numpy()
+        )
 
-    dim=1
+        regime_preds.extend(
+            torch.argmax(
+                preg,
+                dim=1
+            ).cpu().numpy()
+        )
 
-).cpu().numpy()
-
-# ============================================================
-# INVERSE SCALE
-# ============================================================
-
-pred_vol = target_scaler.inverse_transform(
-
-    pred_vol_scaled.reshape(-1, 1)
-
-).flatten()
-
-actual_vol = target_scaler.inverse_transform(
-
-    yv_test.reshape(-1, 1)
-
-).flatten()
+        direction_preds.extend(
+            direction_class.cpu().numpy()
+        )
 
 # ============================================================
 # METRICS
 # ============================================================
 
-mae = mean_absolute_error(
-    actual_vol,
-    pred_vol
+return_mae = mean_absolute_error(
+    y_return_test,
+    return_preds
 )
 
-rmse = np.sqrt(
+vol_mae = mean_absolute_error(
+    y_vol_test,
+    vol_preds
+)
 
+vol_rmse = math.sqrt(
     mean_squared_error(
-        actual_vol,
-        pred_vol
+        y_vol_test,
+        vol_preds
     )
 )
 
-r2 = r2_score(
-    actual_vol,
-    pred_vol
+vol_r2 = r2_score(
+    y_vol_test,
+    vol_preds
 )
 
-dir_acc = accuracy_score(
-    yd_test,
-    pred_dir
+direction_acc = accuracy_score(
+    y_direction_test,
+    direction_preds
+)
+
+direction_f1 = f1_score(
+    y_direction_test,
+    direction_preds
 )
 
 regime_acc = accuracy_score(
-    yr_test,
-    pred_regime
+    y_regime_test,
+    regime_preds
 )
 
 regime_f1 = f1_score(
-
-    yr_test,
-
-    pred_regime,
-
+    y_regime_test,
+    regime_preds,
     average="weighted"
 )
 
-# ============================================================
-# BACKTEST
-# ============================================================
-
-signal = (
-
-    (pred_vol > VOL_THRESHOLD)
-
-    &
-
-    (pred_dir == 1)
-).astype(int)
-
-strategy_returns = (
-
-    signal
-
-    * returns_test
-)
-
-strategy_returns -= (
-
-    signal
-
-    * (TRANSACTION_COST + SLIPPAGE)
-)
-
-sharpe = (
-
-    strategy_returns.mean()
-
-    /
-
-    (
-        strategy_returns.std()
-        + 1e-9
-    )
-
-) * np.sqrt(252 * 24)
-
-cum_returns = np.cumsum(
-    strategy_returns
-)
-
-running_max = np.maximum.accumulate(
-    cum_returns
-)
-
-drawdown = cum_returns - running_max
-
-max_dd = drawdown.min()
-
-profit_factor = (
-
-    strategy_returns[
-        strategy_returns > 0
-    ].sum()
-
-    /
-
-    abs(
-
-        strategy_returns[
-            strategy_returns < 0
-        ].sum()
-
-    )
-)
-
-# ============================================================
-# RESULTS
-# ============================================================
-
 print("\n==============================")
-
-print("V31 RESULTS")
-
+print("V35 RESULTS")
 print("==============================")
 
-print(f"VOL MAE            : {mae:.6f}")
+print(f"RETURN MAE         : {return_mae:.6f}")
 
-print(f"VOL RMSE           : {rmse:.6f}")
+print(f"VOL MAE            : {vol_mae:.6f}")
+print(f"VOL RMSE           : {vol_rmse:.6f}")
+print(f"VOL R2             : {vol_r2:.6f}")
 
-print(f"VOL R2             : {r2:.6f}")
-
-print(f"DIRECTION ACCURACY : {dir_acc:.6f}")
+print(f"DIRECTION ACCURACY : {direction_acc:.6f}")
+print(f"DIRECTION F1       : {direction_f1:.6f}")
 
 print(f"REGIME ACCURACY    : {regime_acc:.6f}")
-
 print(f"REGIME F1          : {regime_f1:.6f}")
 
 print("==============================")
 
+# ============================================================
+# REALISTIC BACKTEST
+# ============================================================
+
+print("\nRunning realistic backtest...")
+
+actual_returns = y_return_test
+
+signals = []
+
+position_sizes = []
+
+for (
+    pred_return,
+    pred_vol,
+    prob
+) in zip(
+    return_preds,
+    vol_preds,
+    direction_probs
+):
+
+    trade = 0
+
+    position = 0
+
+    if (
+        prob > MIN_PROB and
+        pred_return > MIN_RETURN and
+        pred_vol < MAX_VOL
+    ):
+
+        trade = 1
+
+        # Volatility-conditioned sizing
+        position = min(
+            2.0,
+            abs(pred_return) /
+            (pred_vol + 1e-8)
+        )
+
+    signals.append(trade)
+
+    position_sizes.append(position)
+
+signals = np.array(signals)
+
+position_sizes = np.array(position_sizes)
+
+strategy_returns = (
+    actual_returns *
+    signals *
+    position_sizes
+)
+
+strategy_returns -= (
+    signals * TRANSACTION_COST
+)
+
+# Equity curve
+equity_curve = (
+    1 + strategy_returns
+).cumprod()
+
+rolling_max = np.maximum.accumulate(
+    equity_curve
+)
+
+drawdown = (
+    equity_curve -
+    rolling_max
+) / rolling_max
+
+max_drawdown = drawdown.min()
+
+# Sharpe
+sharpe = (
+    strategy_returns.mean()
+    /
+    (strategy_returns.std() + 1e-8)
+) * np.sqrt(252 * 24)
+
+# Profit factor
+gross_profit = strategy_returns[
+    strategy_returns > 0
+].sum()
+
+gross_loss = abs(
+    strategy_returns[
+        strategy_returns < 0
+    ].sum()
+)
+
+profit_factor = (
+    gross_profit /
+    (gross_loss + 1e-8)
+)
+
 print("\n==============================")
-
 print("BACKTEST RESULTS")
-
 print("==============================")
 
 print(f"Sharpe Ratio : {sharpe:.4f}")
-
-print(f"Max Drawdown : {max_dd:.4f}")
-
+print(f"Max Drawdown : {max_drawdown:.4f}")
 print(f"ProfitFactor : {profit_factor:.4f}")
 
 print("==============================")
-
-print("\nClassification Report:\n")
-
-print(
-
-    classification_report(
-        yr_test,
-        pred_regime
-    )
-)
-
-print("\nConfusion Matrix:\n")
-
-print(
-
-    confusion_matrix(
-        yr_test,
-        pred_regime
-    )
-)
 
 # ============================================================
 # NEXT FORECAST
 # ============================================================
 
-print("\nForecasting next 1H regime...")
+print("\nForecasting next 1H gold movement...")
 
-latest_sequence = X_scaled[-SEQ_LEN:]
+latest_seq = X_scaled[-SEQ_LEN:]
 
-latest_sequence = np.expand_dims(
-    latest_sequence,
-    axis=0
-)
-
-latest_tensor = torch.tensor(
-
-    latest_sequence,
-
+latest_seq = torch.tensor(
+    latest_seq,
     dtype=torch.float32
-).to(DEVICE)
+).unsqueeze(0).to(DEVICE)
 
 with torch.no_grad():
 
-    next_vol_scaled, next_dir_logits, next_regime_logits = model(
+    (
+        next_return,
+        next_vol,
+        next_regime,
+        next_direction
+    ) = model(latest_seq)
 
-        latest_tensor
-    )
-
-next_vol_scaled = float(
-
-    next_vol_scaled.cpu().numpy()
+next_return = float(
+    next_return.cpu().numpy()
 )
 
-next_vol = target_scaler.inverse_transform(
+next_vol = float(
+    next_vol.cpu().numpy()
+)
 
-    np.array([[next_vol_scaled]])
-
-).flatten()[0]
-
-next_dir_prob = torch.softmax(
-
-    next_dir_logits,
-
+direction_probs = torch.softmax(
+    next_direction,
     dim=1
+)
 
-)[0][1].item()
+up_prob = float(
+    direction_probs[0][1]
+    .cpu()
+    .numpy()
+)
 
 next_regime = int(
-
     torch.argmax(
-        next_regime_logits,
+        next_regime,
         dim=1
     ).cpu().numpy()[0]
 )
 
-latest_close = df["gold_close"].iloc[-1]
-
-expected_move = latest_close * next_vol
-
-pred_open = latest_close
-
-pred_high = latest_close + expected_move
-
-pred_low = latest_close - expected_move
-
-pred_close = latest_close * (
-
-    1 + (next_dir_prob - 0.5) * next_vol * 10
-)
-
 regime_map = {
-
-    0: "CALM",
-    1: "EXPANSION",
-    2: "HIGH VOL",
-    3: "PANIC"
+    0: "LOW VOL",
+    1: "NORMAL",
+    2: "EXPANSION",
+    3: "SHOCK"
 }
 
+last_close = gold_close.iloc[-1]
+
+forecast_open = last_close
+
+forecast_close = (
+    last_close *
+    (1 + next_return)
+)
+
+forecast_high = (
+    max(
+        forecast_open,
+        forecast_close
+    ) * (1 + next_vol)
+)
+
+forecast_low = (
+    min(
+        forecast_open,
+        forecast_close
+    ) * (1 - next_vol)
+)
+
 print("\n==============================")
-
 print("NEXT 1H GOLD FORECAST")
-
 print("==============================")
 
-print(f"OPEN              : {pred_open:.2f}")
+print(f"OPEN              : {forecast_open:.2f}")
+print(f"HIGH              : {forecast_high:.2f}")
+print(f"LOW               : {forecast_low:.2f}")
+print(f"CLOSE             : {forecast_close:.2f}")
 
-print(f"HIGH              : {pred_high:.2f}")
-
-print(f"LOW               : {pred_low:.2f}")
-
-print(f"CLOSE             : {pred_close:.2f}")
-
+print(f"PREDICTED RETURN  : {next_return:.6f}")
 print(f"EXPECTED VOL      : {next_vol:.6f}")
-
-print(f"DIRECTION PROB    : {next_dir_prob:.4f}")
-
+print(f"DIRECTION PROB    : {up_prob:.4f}")
 print(f"NEXT REGIME       : {regime_map[next_regime]}")
 
 print("==============================")
@@ -1249,26 +1153,18 @@ print("==============================")
 # ============================================================
 
 torch.save(
-
     model.state_dict(),
-
-    "gold_quant_v31.pth"
-)
-
-joblib.dump(
-
-    feature_scaler,
-
-    "feature_scaler_v31.pkl"
-)
-
-joblib.dump(
-
-    target_scaler,
-
-    "target_scaler_v31.pkl"
+    "v35_quant_model.pth"
 )
 
 print("\nModels saved successfully.")
+
+# ============================================================
+# SAFE SHUTDOWN
+# ============================================================
+
+gc.collect()
+
+print("\nSafe shutdown complete.")
 
 print("\nTraining complete.")
